@@ -1,0 +1,97 @@
+# ---------- Secrets / environment ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- Logs & install output ----------
+*.log
+*.err
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+pip-install.*
+pw-install.*
+
+# ---------- Python / Django (backend) ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Django
+*.sqlite3
+*.sqlite3-journal
+media/
+staticfiles/
+local_settings.py
+celerybeat-schedule
+instance/
+
+# ---------- Node / Vite (frontend) ----------
+node_modules/
+dist/
+dist-ssr/
+build/
+.vite/
+.cache/
+*.local
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+
+# Package manager caches
+.npm
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.pnpm-store/
+
+# ---------- OS / Editor ----------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+*~
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# ---------- Misc ----------
+*.bak
+*.orig
+*.rej
+*.tmp
+*.pid
