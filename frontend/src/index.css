@@ -1,9 +1,211 @@
-:root {
-  line-height: 1.5;
+@import "tailwindcss";
+@plugin "@tailwindcss/forms";
+
+/* ============================================================
+   DESIGN TOKENS
+   Accessibility Copilot — technical / editorial system
+   ============================================================ */
+@theme {
+  /* Brand accent — the only accent colour in the system.
+     #009A44 is used for fills/bars; --color-primary-text is the darker
+     shade reserved for green *text*, which #009A44 cannot reach at 4.5:1. */
+  --color-primary: #009a44;
+  --color-primary-dark: #007a37;
+  --color-primary-text: #007a37;
+  /* Solid fills behind white text need >= 4.5:1, which #009A44 cannot reach,
+     so buttons use the darker shade. #009A44 stays for bars and marks. */
+  --color-primary-deep: #00622d;
+  --color-primary-soft: #e6f4ec;
+
+  /* Surfaces */
+  --color-canvas: #fafaf9;
+  --color-surface: #ffffff;
+
+  /* Dark technical panels */
+  --color-ink: #0c0f0e;
+  --color-ink-raised: #141918;
+  --color-ink-line: #232a28;
+  --color-ink-text: #e8ecea;
+  --color-ink-muted: #8b9691;
+  /* Dimmer than ink-muted but still >= 4.5:1 on the ink panel. Used instead
+     of opacity utilities, which blend text toward the background and fail. */
+  --color-ink-dim: #7a8480;
+
+  /* Borders + text */
+  --color-line: #e3e3df;
+  --color-line-strong: #cfcfc9;
+  --color-ink-fg: #14171a;
+  --color-body: #4a5150;
+  --color-subtle: #676d6b;
+
+  /* Severity — intentionally restrained, used only for indicators */
+  --color-critical: #b42318;
+  --color-serious: #b54708;
+  --color-moderate: #4b5563;
+  --color-minor: #6a6f6d;
+
+  /* Typography */
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono",
+    "Roboto Mono", Menlo, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
 }
 
-body {
-  margin: 0;
-  min-width: 320px;
-  min-height: 100vh;
+@layer base {
+  :root {
+    line-height: 1.5;
+    color-scheme: light;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    background-color: var(--color-canvas);
+    color: var(--color-body);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Visible, consistent focus for every interactive element */
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+    border-radius: 1px;
+  }
+
+  /* Dark panels need a light focus ring to stay visible */
+  [data-surface="dark"] :focus-visible {
+    outline-color: #4ade80;
+  }
+
+  ::selection {
+    background: var(--color-primary);
+    color: #fff;
+  }
+}
+
+@layer components {
+  /* Subtle engineering grid used behind the page */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, rgba(20, 23, 26, 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(20, 23, 26, 0.045) 1px, transparent 1px);
+    background-size: 72px 72px;
+  }
+
+  /* Faint grid for dark panels */
+  .bg-grid-dark {
+    background-image:
+      linear-gradient(to right, rgba(232, 236, 234, 0.05) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(232, 236, 234, 0.05) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* Small uppercase technical label */
+  .tech-label {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    line-height: 1;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 500;
+  }
+
+  /* Large editorial heading */
+  .editorial {
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 0.95;
+    color: var(--color-ink-fg);
+  }
+}
+
+@layer utilities {
+  /* Animations — all disabled under prefers-reduced-motion */
+  @keyframes ac-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  @keyframes ac-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(300%);
+    }
+  }
+
+  @keyframes ac-fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-ac-pulse {
+    animation: ac-pulse 1.4s ease-in-out infinite;
+  }
+
+  .animate-ac-sweep {
+    animation: ac-sweep 1.6s ease-in-out infinite;
+  }
+
+  .animate-ac-fade-up {
+    animation: ac-fade-up 0.25s ease-out both;
+  }
+
+  /* Skip link. Tailwind's sr-only carries a -1px margin, which parks the
+     element at left: -1px; pin it at 0 and clip instead so it cannot
+     register as horizontal overflow. */
+  .skip-link {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 100;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    clip-path: inset(50%);
+  }
+
+  .skip-link:focus-visible {
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+  }
+}
+
+/* Honour the OS reduced-motion preference everywhere */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

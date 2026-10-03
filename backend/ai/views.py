@@ -1,55 +1,59 @@
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.shortcuts import get_object_or_404
+import logging
 
-from scanner.models import Issue, AIAnalysis
-from .services import AIService
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from scanner.models import AIAnalysis, Issue
+
+from .serializers import AIAnalysisResponseSerializer
+from .services import AIService, AIServiceError
+
+logger = logging.getLogger(__name__)
+
+FIELDS = (
+    'explanation',
+    'why_it_matters',
+    'suggested_fix',
+    'corrected_code',
+    'developer_tip',
+)
+
+
+def _run_and_store(issue, run):
+    """Call Gemini, persist the brief, and return the API payload.
+
+    A provider failure is logged with the precise reason and answered with a
+    generic message, so neither the API key nor a stack trace reaches the
+    browser.
+    """
+    try:
+        result = run()
+    except AIServiceError as exc:
+        logger.warning('Gemini request failed for issue %s: %s', issue.pk, exc.reason)
+        return Response({'detail': exc.user_message}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    analysis, _ = AIAnalysis.objects.update_or_create(
+        issue=issue,
+        defaults={field: result.get(field, '') for field in FIELDS},
+    )
+    return Response(AIAnalysisResponseSerializer(analysis).data)
 
 
 class AnalyzeIssueView(APIView):
+    """Explain a real axe-core finding."""
+
     def post(self, request, id):
         issue = get_object_or_404(Issue, id=id)
         service = AIService()
-        result = service.analyze_issue(issue)
-        ai_analysis, _ = AIAnalysis.objects.update_or_create(
-            issue=issue,
-            defaults={
-                'explanation': result.get('explanation', ''),
-                'why_it_matters': result.get('why_it_matters', ''),
-                'suggested_fix': result.get('suggested_fix', ''),
-                'corrected_code': result.get('corrected_code', ''),
-                'developer_tip': result.get('developer_tip', ''),
-            }
-        )
-        return Response({
-            'explanation': ai_analysis.explanation,
-            'why_it_matters': ai_analysis.why_it_matters,
-            'suggested_fix': ai_analysis.suggested_fix,
-            'corrected_code': ai_analysis.corrected_code,
-            'developer_tip': ai_analysis.developer_tip,
-        })
+        return _run_and_store(issue, lambda: service.analyze_issue(issue))
 
 
 class GenerateFixView(APIView):
+    """Produce a corrected snippet for a real axe-core finding."""
+
     def post(self, request, id):
         issue = get_object_or_404(Issue, id=id)
         service = AIService()
-        result = service.generate_fix(issue)
-        ai_analysis, _ = AIAnalysis.objects.update_or_create(
-            issue=issue,
-            defaults={
-                'explanation': result.get('explanation', ''),
-                'why_it_matters': result.get('why_it_matters', ''),
-                'suggested_fix': result.get('suggested_fix', ''),
-                'corrected_code': result.get('corrected_code', ''),
-                'developer_tip': result.get('developer_tip', ''),
-            }
-        )
-        return Response({
-            'explanation': ai_analysis.explanation,
-            'why_it_matters': ai_analysis.why_it_matters,
-            'suggested_fix': ai_analysis.suggested_fix,
-            'corrected_code': ai_analysis.corrected_code,
-            'developer_tip': ai_analysis.developer_tip,
-        })
+        return _run_and_store(issue, lambda: service.generate_fix(issue))

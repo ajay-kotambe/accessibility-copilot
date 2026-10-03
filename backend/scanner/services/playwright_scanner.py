@@ -1,8 +1,8 @@
-import asyncio
-import time
+import threading
 from pathlib import Path
+from django.db import connections
 from django.utils import timezone
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 
 from ..models import Scan, Page, Issue
 from .url_security import normalize_url, is_private_host
@@ -68,11 +68,85 @@ def wcag_category(tags=None):
     return ''
 
 
+def db(fn, *args, **kwargs):
+    """Execute an ORM callable on a worker thread and return its result.
+
+    Playwright's synchronous API drives an asyncio event loop inside the
+    calling thread. Django's async-unsafe guard inspects for a running loop
+    and rejects any ORM call made from that thread, so every write issued
+    while the browser is open has to happen somewhere else. A fresh thread
+    has no running loop, so the ORM call is legal there.
+    """
+    box = {}
+
+    def runner():
+        try:
+            box['value'] = fn(*args, **kwargs)
+        except Exception as exc:
+            box['error'] = exc
+        finally:
+            connections.close_all()
+
+    thread = threading.Thread(target=runner, name='scan-db')
+    thread.start()
+    thread.join()
+
+    if 'error' in box:
+        raise box['error']
+    return box.get('value')
+
+
+def _set_status(scan_id, status, **fields):
+    """Persist a pipeline status transition from inside the browser block."""
+
+    def apply():
+        record = Scan.objects.get(id=scan_id)
+        record.status = status
+        for key, value in fields.items():
+            setattr(record, key, value)
+        record.save()
+
+    db(apply)
+
+
+def _inject_axe(context):
+    """Load axe-core into every frame before navigation.
+
+    page.add_script_tag() inserts an inline <script> element, which a site's
+    Content-Security-Policy refuses whenever script-src omits 'unsafe-inline'
+    (most large sites). context.add_init_script() goes through CDP's
+    Page.addScriptToEvaluateOnNewDocument instead, so it is not subject to
+    the page CSP and axe survives strict policies. axe-core only defines
+    window.axe at this point; the actual run happens via page.evaluate() in
+    run_axe(), which is likewise not CSP-gated.
+
+    Returns False only if axe-core is not available locally, so the scan can
+    still complete with the custom rules instead of failing outright.
+    """
+    if not AXE_PATH.exists():
+        return False
+    context.add_init_script(path=str(AXE_PATH))
+    return True
+
+
+def _short_error(exc, limit=300):
+    """Keep browser/CSP noise out of error_message.
+
+    CSP violations arrive as multi-kilobyte policy strings that are useless
+    to a user and wreck the history layout.
+    """
+    text = ' '.join(str(exc).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + '...'
+
+
 def run_scan(scan_id):
-    asyncio.run(_run_scan(scan_id))
+    """Execute the scan pipeline.
 
-
-async def _run_scan(scan_id):
+    Status transitions and issue persistence stay real: the POST handler
+    blocks until the scan settles, so the client receives a terminal record.
+    """
     scan = Scan.objects.get(id=scan_id)
     try:
         scan.status = Scan.CONNECTING
@@ -81,60 +155,74 @@ async def _run_scan(scan_id):
         parsed = __import__('urllib.parse').parse.urlparse(url)
         if is_private_host(parsed.netloc):
             raise ValueError('Private or unsafe URLs are not allowed')
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
+
+        title = ''
+        axe_result = {}
+        custom = []
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
                 '--disable-dev-shm-usage',
                 '--disable-setuid-sandbox',
                 '--no-sandbox',
             ])
-            context = await browser.new_context()
-            page = await context.new_page()
-            scan.status = Scan.LOADING
-            scan.save()
+            context = browser.new_context()
+            axe_loaded = _inject_axe(context)
+            page = context.new_page()
+
+            _set_status(scan_id, Scan.LOADING)
             try:
-                await page.goto(url, timeout=30000, wait_until='networkidle')
+                page.goto(url, timeout=30000, wait_until='networkidle')
             except Exception:
-                await page.goto(url, timeout=30000, wait_until='domcontentloaded')
-            title = await page.title()
-            scan_page = Page.objects.create(scan=scan, url=url, title=title or '')
-            scan.status = Scan.SCANNING
-            scan.save()
-            if AXE_PATH.exists():
-                await page.add_script_tag(path=str(AXE_PATH))
+                page.goto(url, timeout=30000, wait_until='domcontentloaded')
+            title = page.title() or ''
+
+            _set_status(scan_id, Scan.SCANNING)
+            # axe is already present via add_init_script; calling axe.run()
+            # through page.evaluate() bypasses the page CSP.
+            if axe_loaded:
+                axe_result = run_axe(page) or {}
             else:
-                await page.add_script_tag(url='https://unpkg.com/axe-core@4.10.0/axe.min.js')
-            axe_result = await run_axe(page)
-            issues = []
-            if axe_result and not axe_result.get('error'):
-                for v in axe_result.get('violations', []):
-                    for n in v.get('nodes', []):
-                        issues.append(Issue(
-                            scan=scan,
-                            page=scan_page,
-                            rule_id=v.get('id'),
-                            severity=map_severity(v.get('impact') or n.get('impact')),
-                            category=categorize(v.get('id'), v.get('tags')),
-                            description=v.get('description') or '',
-                            selector='; '.join(n.get('target')) if n.get('target') else '',
-                            html_snippet=n.get('html') or '',
-                            help_url=v.get('helpUrl') or '',
-                            impact=v.get('impact') or n.get('impact') or '',
-                        ))
-            custom = run_custom_rules(page)
-            for c in custom:
-                issues.append(Issue(scan=scan, page=scan_page, **c))
-            scan.status = Scan.PROCESSING
-            scan.save()
-            Issue.objects.bulk_create(issues)
-            score = calculate_score(issues)
-            scan.score = score
-            scan.status = Scan.COMPLETED
-            scan.completed_at = timezone.now()
-            scan.save()
-            await browser.close()
-    except Exception as e:
-        scan.status = Scan.FAILED
-        scan.error_message = str(e)
+                axe_result = {'error': 'axe-core unavailable'}
+            custom = run_custom_rules(page) or []
+            custom = run_custom_rules(page) or []
+            browser.close()
+
+        _set_status(scan_id, Scan.PROCESSING)
+
+        # Persist findings outside the browser block, where the ORM is legal
+        # on the calling thread again.
+        scan.refresh_from_db()
+        scan_page = Page.objects.create(scan=scan, url=url, title=title)
+        issues = []
+        if not axe_result.get('error'):
+            for v in axe_result.get('violations', []):
+                for n in v.get('nodes', []):
+                    issues.append(Issue(
+                        scan=scan,
+                        page=scan_page,
+                        rule_id=v.get('id'),
+                        severity=map_severity(v.get('impact') or n.get('impact')),
+                        category=categorize(v.get('id'), v.get('tags')),
+                        description=v.get('description') or '',
+                        selector='; '.join(n.get('target')) if n.get('target') else '',
+                        html_snippet=n.get('html') or '',
+                        help_url=v.get('helpUrl') or '',
+                        impact=v.get('impact') or n.get('impact') or '',
+                    ))
+        for c in custom:
+            issues.append(Issue(scan=scan, page=scan_page, **c))
+
+        Issue.objects.bulk_create(issues)
+        score = calculate_score(issues)
+        scan.score = score
+        scan.status = Scan.COMPLETED
         scan.completed_at = timezone.now()
         scan.save()
+    except Exception as e:
+        Scan.objects.filter(id=scan_id).update(
+            status=Scan.FAILED,
+            error_message=_short_error(e),
+            completed_at=timezone.now(),
+        )
         raise

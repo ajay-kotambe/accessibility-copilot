@@ -55,7 +55,9 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///db.sqlite3')
+# `or` rather than a getenv default: a blank DATABASE_URL= in .env is an empty
+# string, not None, and would otherwise fall through to dj_database_url.parse('').
+DATABASE_URL = os.getenv('DATABASE_URL') or 'sqlite:///db.sqlite3'
 if DATABASE_URL.startswith('sqlite:///'):
     db_path = DATABASE_URL.replace('sqlite:///', '')
     if not db_path.startswith('/') and ':' not in db_path:
@@ -96,4 +98,7 @@ REST_FRAMEWORK = {
 }
 
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+
+# AI Copilot provider. Backend-only: these are never exposed to the frontend.
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL') or 'gemini-3.8-flash'

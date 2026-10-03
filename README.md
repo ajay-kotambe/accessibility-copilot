@@ -7,7 +7,7 @@ AI-assisted web accessibility engineering platform that helps developers scan we
 **IMPORTANT:** Real working application. Findings and score come from actual website scans using Playwright + axe-core. AI is only used for explanation and suggested fixes.
 
 ## Architecture
-React + TypeScript + Vite (frontend), Django + DRF (backend), Playwright + Chromium + axe-core (scanner), OpenAI (AI), SQLite (dev) / PostgreSQL (prod).
+React + TypeScript + Vite (frontend), Django + DRF (backend), Playwright + Chromium + axe-core (scanner), Google Gemini (AI), SQLite (dev) / PostgreSQL (prod).
 
 ## Quick Start
 
