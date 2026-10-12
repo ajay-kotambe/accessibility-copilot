@@ -1,15 +1,25 @@
+import logging
 import threading
 from pathlib import Path
+
 from django.db import connections
 from django.utils import timezone
 from playwright.sync_api import sync_playwright
 
 from ..models import Scan, Page, Issue
+from .navigation_errors import (
+    MESSAGE_GENERIC,
+    ScanNavigationError,
+    friendly_navigation_error,
+    user_message_for,
+)
 from .url_security import normalize_url, is_private_host
 from .axe_scanner import run_axe
 from .custom_rules import run_custom_rules
 from .scoring import calculate_score
 
+
+logger = logging.getLogger(__name__)
 
 AXE_PATH = Path(__file__).parent / 'axe.min.js'
 
@@ -129,18 +139,6 @@ def _inject_axe(context):
     return True
 
 
-def _short_error(exc, limit=300):
-    """Keep browser/CSP noise out of error_message.
-
-    CSP violations arrive as multi-kilobyte policy strings that are useless
-    to a user and wreck the history layout.
-    """
-    text = ' '.join(str(exc).split())
-    if len(text) <= limit:
-        return text
-    return text[:limit] + '...'
-
-
 def run_scan(scan_id):
     """Execute the scan pipeline.
 
@@ -173,8 +171,18 @@ def run_scan(scan_id):
             _set_status(scan_id, Scan.LOADING)
             try:
                 page.goto(url, timeout=30000, wait_until='networkidle')
-            except Exception:
-                page.goto(url, timeout=30000, wait_until='domcontentloaded')
+            except Exception as first_exc:
+                # A busy page can miss networkidle but still be usable, so the
+                # retry is kept. If the fallback also fails, the raw browser
+                # error is logged and only a friendly message propagates.
+                try:
+                    page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                except Exception as second_exc:
+                    message = friendly_navigation_error(second_exc)
+                    if message == MESSAGE_GENERIC:
+                        message = friendly_navigation_error(first_exc)
+                    logger.warning('Navigation to %s failed: %s', url, second_exc)
+                    raise ScanNavigationError(message) from second_exc
             title = page.title() or ''
 
             _set_status(scan_id, Scan.SCANNING)
@@ -220,9 +228,14 @@ def run_scan(scan_id):
         scan.completed_at = timezone.now()
         scan.save()
     except Exception as e:
+        # Technical detail stays in the server log; the record and the API only
+        # ever expose a safe, user-facing sentence. A failed scan is not an
+        # accessibility result, so it carries no score.
+        logger.error('Scan %s failed for %s: %s', scan_id, scan.url, e, exc_info=True)
         Scan.objects.filter(id=scan_id).update(
             status=Scan.FAILED,
-            error_message=_short_error(e),
+            error_message=user_message_for(e),
+            score=None,
             completed_at=timezone.now(),
         )
         raise

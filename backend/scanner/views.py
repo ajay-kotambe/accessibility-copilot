@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from .models import Scan, Page, Issue
 from .serializers import ScanSerializer, IssueSerializer
+from .services.navigation_errors import user_message_for
 from .services.playwright_scanner import run_scan
 
 
@@ -23,11 +24,17 @@ class ScanListCreateView(APIView):
         try:
             run_scan(scan.id)
         except Exception as e:
+            # The raw error is logged by the scanner; only the friendly message
+            # is persisted and returned. A failed scan gets no accessibility
+            # score. The response keys are unchanged.
+            message = user_message_for(e)
+            scan.refresh_from_db()
             scan.status = Scan.FAILED
-            scan.error_message = str(e)
-            scan.completed_at = timezone.now()
+            scan.error_message = message
+            scan.score = None
+            scan.completed_at = scan.completed_at or timezone.now()
             scan.save()
-            return Response({'error': str(e), 'scan_id': scan.id}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': message, 'scan_id': scan.id}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         scan.refresh_from_db()
         serializer = ScanSerializer(scan)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
