@@ -1,12 +1,12 @@
-"""Gemini integration for the accessibility Copilot.
+"""NVIDIA NIM integration for the accessibility Copilot.
 
 Division of responsibility
 --------------------------
 Detection is deterministic and stays in the scanner: Playwright drives
 Chromium, axe-core evaluates the live page, and ``scoring.py`` computes the
 score. This module is only reached afterwards, when a developer asks for help
-with an issue that already exists in the database. Gemini explains and repairs
-findings; it is never asked whether a violation exists.
+with an issue that already exists in the database. NVIDIA NIM explains and
+repairs findings; it is never asked whether a violation exists.
 
 The API key is read here, on the Django backend, and is never returned by any
 serializer, view or error message.
@@ -17,17 +17,19 @@ import logging
 import os
 import time
 
+import openai
 from django.conf import settings
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
+from openai import OpenAI
 
 from .prompts import EXPLAIN_ISSUE_PROMPT, FIX_ISSUE_PROMPT, SYSTEM_INSTRUCTION
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = 'gemini-3.8-flash'
-REQUEST_TIMEOUT_MS = 60_000
+# OpenAI-compatible endpoint for NVIDIA NIM. The backend reaches it through the
+# OpenAI v1.x client; the key stays server-side and is never sent to browsers.
+NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
+DEFAULT_MODEL = 'moonshotai/kimi-k3'
+REQUEST_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_TOKENS = 4096
 
 # Rate limits, capacity spikes and read timeouts are transient and were
@@ -49,21 +51,7 @@ RESPONSE_FIELDS = (
     'developer_tip',
 )
 
-# Gemini returns JSON against this schema instead of free-form markdown, so the
-# five fields the frontend expects arrive under predictable keys.
-RESPONSE_SCHEMA = {
-    'type': 'OBJECT',
-    'properties': {
-        'explanation': {'type': 'STRING'},
-        'why_it_matters': {'type': 'STRING'},
-        'suggested_fix': {'type': 'STRING'},
-        'corrected_code': {'type': 'STRING'},
-        'developer_tip': {'type': 'STRING'},
-    },
-    'required': list(RESPONSE_FIELDS),
-}
-
-# Ordered prefix -> field, used only if Gemini replies with prose instead of
+# Ordered prefix -> field, used only if the model replies with prose instead of
 # JSON (for example if structured output is unavailable for the model).
 _SECTION_ALIASES = {
     'explanation': 'explanation',
@@ -80,7 +68,7 @@ _SECTION_ALIASES = {
 
 
 class AIServiceError(Exception):
-    """A Gemini-side failure.
+    """An NVIDIA NIM-side failure.
 
     ``reason`` is for server logs only and may name the provider, the status
     code or the model. ``user_message`` is the only text safe to send to a
@@ -102,8 +90,8 @@ def _setting(name):
 
 class AIService:
     def __init__(self, api_key=None, model=None):
-        self.api_key = api_key if api_key is not None else _setting('GEMINI_API_KEY')
-        self.model = model or _setting('GEMINI_MODEL') or DEFAULT_MODEL
+        self.api_key = api_key if api_key is not None else _setting('NVIDIA_API_KEY')
+        self.model = model or _setting('NVIDIA_MODEL') or DEFAULT_MODEL
         self._client = None
 
     @property
@@ -115,14 +103,21 @@ class AIService:
     def _build_client(self):
         key = (self.api_key or '').strip()
         if not key:
-            raise AIServiceError('GEMINI_API_KEY is not set', NOT_CONFIGURED)
+            raise AIServiceError('NVIDIA_API_KEY is not set', NOT_CONFIGURED)
         try:
-            return genai.Client(api_key=key)
+            return OpenAI(
+                api_key=key,
+                base_url=NVIDIA_BASE_URL,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                # Retries are handled explicitly in ``_generate``; disabling
+                # the SDK's implicit retries keeps that the single source of
+                # truth instead of multiplying attempts.
+                max_retries=0,
+            )
         except ValueError as exc:
-            # google-genai validates key presence on construction.
-            raise AIServiceError(f'Gemini client rejected the key: {exc}', NOT_CONFIGURED) from exc
+            raise AIServiceError(f'NVIDIA NIM client rejected the key: {exc}', NOT_CONFIGURED) from exc
         except Exception as exc:  # pragma: no cover - defensive
-            raise AIServiceError(f'Gemini client init failed: {exc}') from exc
+            raise AIServiceError(f'NVIDIA NIM client init failed: {exc}') from exc
 
     @staticmethod
     def _issue_context(issue):
@@ -138,68 +133,86 @@ class AIService:
         }
 
     def _generate(self, prompt):
-        """Call Gemini and return the raw text of its reply.
+        """Call NVIDIA NIM and return the raw text of its reply.
 
         Transient provider conditions are retried; configuration problems are
         not, because repeating a missing API key only delays the real error.
         """
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            response_mime_type='application/json',
-            response_schema=RESPONSE_SCHEMA,
-            http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
-        )
+        messages = [
+            {'role': 'system', 'content': SYSTEM_INSTRUCTION},
+            {'role': 'user', 'content': prompt},
+        ]
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             last = attempt == MAX_ATTEMPTS
             try:
-                response = self.client.models.generate_content(
+                response = self.client.chat.completions.create(
                     model=self.model,
-                    contents=prompt,
-                    config=config,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                    response_format={'type': 'json_object'},
                 )
             except AIServiceError:
                 # Raised by the `client` property when the key is missing or
                 # rejected. Not retryable, and not an API failure.
                 raise
-            except APIError as exc:
+            except openai.APIStatusError as exc:
                 error = self._translate(exc)
                 if last or not self._is_retryable(exc):
                     raise error from exc
-                logger.warning('Gemini attempt %s/%s failed (%s); retrying',
+                logger.warning('NVIDIA NIM attempt %s/%s failed (%s); retrying',
                                attempt, MAX_ATTEMPTS, error.reason)
-            except TimeoutError as exc:
+            except openai.APITimeoutError as exc:
                 if last:
-                    raise AIServiceError(f'Gemini request timed out: {exc}') from exc
-                logger.warning('Gemini attempt %s/%s timed out; retrying', attempt, MAX_ATTEMPTS)
-            except Exception as exc:
-                # httpx surfaces timeouts under its own type names.
+                    raise AIServiceError(f'NVIDIA NIM request timed out: {exc}') from exc
+                logger.warning('NVIDIA NIM attempt %s/%s timed out; retrying', attempt, MAX_ATTEMPTS)
+            except openai.OpenAIError as exc:
+                # Other client-side failures, including connection errors.
                 timed_out = ('timeout' in type(exc).__name__.lower()
                              or 'timeout' in str(exc).lower())
                 if last or not timed_out:
                     raise AIServiceError(
-                        f'Gemini request failed: {type(exc).__name__}: {exc}') from exc
-                logger.warning('Gemini attempt %s/%s timed out (%s); retrying',
+                        f'NVIDIA NIM request failed: {type(exc).__name__}: {exc}') from exc
+                logger.warning('NVIDIA NIM attempt %s/%s timed out (%s); retrying',
                                attempt, MAX_ATTEMPTS, type(exc).__name__)
             else:
-                text = getattr(response, 'text', None)
+                text = self._reply_text(response)
                 if not text:
-                    raise AIServiceError('Gemini returned an empty response body')
+                    raise AIServiceError('NVIDIA NIM returned an empty response body')
                 return text
 
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-        raise AIServiceError('Gemini request failed after retries')  # pragma: no cover
+        raise AIServiceError('NVIDIA NIM request failed after retries')  # pragma: no cover
+
+    @staticmethod
+    def _reply_text(response):
+        """Extract the assistant message text from a chat completion."""
+        choices = getattr(response, 'choices', None) or []
+        if not choices:
+            return None
+        message = getattr(choices[0], 'message', None)
+        return getattr(message, 'content', None)
+
+    @staticmethod
+    def _status_code(exc):
+        """Read the HTTP status from an OpenAI-compatible SDK exception."""
+        code = getattr(exc, 'status_code', None)
+        if code is None:
+            code = getattr(exc, 'code', None)
+        try:
+            return int(code or 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _is_quota_exhausted(exc):
         """Tell an exhausted account quota from a transient rate limit.
 
-        Google answers both with HTTP 429, but retrying a hard quota exhaustion
-        only adds latency to an error the developer cannot clear by waiting a
-        few seconds, so it must not be treated as transient.
+        Rate limits and hard quota exhaustion can both arrive as HTTP 429, but
+        retrying an exhausted quota only adds latency to an error the developer
+        cannot clear by waiting, so it must not be treated as transient.
         """
         detail = (getattr(exc, 'message', None) or str(exc)).lower()
         return 'quota exceeded' in detail or 'exceeded your current quota' in detail
@@ -209,33 +222,26 @@ class AIService:
         """True only for provider conditions that clear without user action."""
         if cls._is_quota_exhausted(exc):
             return False
-        try:
-            code = int(getattr(exc, 'code', None) or 0)
-        except (TypeError, ValueError):
-            return False
-        return code in RETRYABLE_CODES
+        return cls._status_code(exc) in RETRYABLE_CODES
 
     def _translate(self, exc):
         """Map a provider exception onto a clean, loggable AIServiceError."""
-        try:
-            code = int(getattr(exc, 'code', None) or 0)
-        except (TypeError, ValueError):
-            code = 0
+        code = self._status_code(exc)
         detail = (getattr(exc, 'message', None) or str(exc))[:300]
         if code in (401, 403):
-            return AIServiceError(f'Gemini rejected the API key (HTTP {code}): {detail}', NOT_CONFIGURED)
+            return AIServiceError(f'NVIDIA NIM rejected the API key (HTTP {code}): {detail}', NOT_CONFIGURED)
         if code == 404:
-            return AIServiceError(f'Gemini model unavailable (HTTP 404): {detail}')
+            return AIServiceError(f'NVIDIA NIM model unavailable (HTTP 404): {detail}')
         if code == 429:
             if self._is_quota_exhausted(exc):
-                return AIServiceError(f'Gemini quota exhausted (HTTP 429): {detail}',
+                return AIServiceError(f'NVIDIA NIM quota exhausted (HTTP 429): {detail}',
                                       QUOTA_EXCEEDED)
-            return AIServiceError(f'Gemini rate limit (HTTP 429): {detail}')
+            return AIServiceError(f'NVIDIA NIM rate limit (HTTP 429): {detail}')
         if code == 400:
-            return AIServiceError(f'Gemini rejected the request (HTTP 400): {detail}')
+            return AIServiceError(f'NVIDIA NIM rejected the request (HTTP 400): {detail}')
         if code >= 500:
-            return AIServiceError(f'Gemini server error (HTTP {code}): {detail}')
-        return AIServiceError(f'Gemini API error (HTTP {code}): {detail}')
+            return AIServiceError(f'NVIDIA NIM server error (HTTP {code}): {detail}')
+        return AIServiceError(f'NVIDIA NIM API error (HTTP {code}): {detail}')
 
     @staticmethod
     def _strip_fence(value):
@@ -258,7 +264,7 @@ class AIService:
 
     @classmethod
     def _normalize(cls, raw):
-        """Coerce a Gemini reply into the five-field contract.
+        """Coerce a model reply into the five-field contract.
 
         Raises AIServiceError rather than storing a half-empty brief, so the
         UI never shows an AI panel with invented or missing content.
@@ -285,7 +291,7 @@ class AIService:
             parsed = cls._parse_sections(text)
 
         if parsed is None:
-            raise AIServiceError(f'Gemini response was not usable: {text[:200]!r}')
+            raise AIServiceError(f'NVIDIA NIM response was not usable: {text[:200]!r}')
 
         result = {}
         for field in RESPONSE_FIELDS:
@@ -297,7 +303,7 @@ class AIService:
         result['corrected_code'] = cls._strip_fence(result['corrected_code'])
 
         if not any(result.values()):
-            raise AIServiceError('Gemini returned an empty brief')
+            raise AIServiceError('NVIDIA NIM returned an empty brief')
         return result
 
     @staticmethod

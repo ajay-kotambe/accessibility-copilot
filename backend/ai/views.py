@@ -22,7 +22,7 @@ FIELDS = (
 
 
 def _run_and_store(issue, run):
-    """Call Gemini, persist the brief, and return the API payload.
+    """Call AI provider, persist the brief, and return the API payload.
 
     A provider failure is logged with the precise reason and answered with a
     generic message, so neither the API key nor a stack trace reaches the
@@ -31,7 +31,7 @@ def _run_and_store(issue, run):
     try:
         result = run()
     except AIServiceError as exc:
-        logger.warning('Gemini request failed for issue %s: %s', issue.pk, exc.reason)
+        logger.warning('AI request failed for issue %s: %s', issue.pk, exc.reason)
         return Response({'detail': exc.user_message}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     analysis, _ = AIAnalysis.objects.update_or_create(

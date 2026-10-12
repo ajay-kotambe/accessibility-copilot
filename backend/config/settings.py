@@ -3,9 +3,17 @@ import os
 from dotenv import load_dotenv
 import dj_database_url
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from explicit paths instead of relying on
+# ``load_dotenv()``'s implicit upward search, which can resolve to a different
+# ``.env`` (or miss the one holding NVIDIA_API_KEY) depending on how the process
+# is launched. ``backend/.env`` is the documented location; the repository-root
+# ``.env`` is loaded as a fallback for keys it does not define. ``load_dotenv``
+# never overrides values that are already present, so nothing is clobbered.
+for _dotenv_path in (BASE_DIR / '.env', BASE_DIR.parent / '.env'):
+    if _dotenv_path.is_file():
+        load_dotenv(_dotenv_path)
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'dev-secret-key-change-in-production')
 
@@ -100,5 +108,5 @@ REST_FRAMEWORK = {
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
 
 # AI Copilot provider. Backend-only: these are never exposed to the frontend.
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
-GEMINI_MODEL = os.getenv('GEMINI_MODEL') or 'gemini-3.8-flash'
+NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', '')
+NVIDIA_MODEL = os.getenv('NVIDIA_MODEL') or 'moonshotai/kimi-k3'

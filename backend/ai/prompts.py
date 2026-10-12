@@ -2,7 +2,7 @@
 
 Scope guard: the accessibility pipeline is Playwright + Chromium + axe-core,
 followed by deterministic scoring. These prompts run *after* a real finding
-already exists in the database. Gemini explains and repairs that finding; it
+already exists in the database. The AI explains and repairs that finding; it
 is never asked whether a violation exists, and it never invents one.
 """
 
