@@ -29,12 +29,14 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'corsheaders',
     'scanner',
     'ai',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -105,7 +107,9 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
 }
 
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+
+CORS_ALLOWED_ORIGINS = [FRONTEND_URL]
 
 # AI Copilot provider. Backend-only: these are never exposed to the frontend.
 NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', '')
