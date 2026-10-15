@@ -208,8 +208,11 @@ class DeploymentConfigTests(TestCase):
         # playwright package.
         self.assertIn('pip install --no-cache-dir -r requirements.txt', dockerfile)
         self.assertIn('FROM python:3.13-slim', dockerfile)
-        self.assertIn('CMD gunicorn config.wsgi:application', dockerfile)
-        self.assertIn('--bind 0.0.0.0:$PORT', dockerfile)
+        # Railway runs a custom start command without a shell, so gunicorn's
+        # args must go through sh -c or $PORT arrives literal and gunicorn
+        # dies with "'$PORT' is not a valid port number".
+        self.assertIn('CMD ["sh", "-c", "gunicorn config.wsgi:application', dockerfile)
+        self.assertIn('--bind 0.0.0.0:${PORT}', dockerfile)
 
     def test_railway_config_keeps_gunicorn_and_migrations(self):
         import json
@@ -218,7 +221,8 @@ class DeploymentConfigTests(TestCase):
         deploy = config['deploy']
         self.assertEqual(
             deploy['startCommand'],
-            'gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300',
+            'sh -c "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT} '
+            '--workers 1 --threads 2 --timeout 300"',
         )
         self.assertEqual(deploy['preDeployCommand'], 'python manage.py migrate --noinput')
         # A buildCommand here would be ignored with a Dockerfile present and

@@ -23,5 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY . .
 
-# Same gunicorn command as railway.json; shell form expands $PORT at runtime.
-CMD gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300
+# Railway executes a custom start command WITHOUT a shell, so a bare $PORT
+# reaches gunicorn literally ("'$PORT' is not a valid port number").
+# sh -c guarantees expansion whether this CMD or railway.json's identical
+# startCommand is used.
+CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 300"]
