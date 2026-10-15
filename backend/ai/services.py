@@ -29,21 +29,25 @@ logger = logging.getLogger(__name__)
 # OpenAI v1.x client; the key stays server-side and is never sent to browsers.
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
 DEFAULT_MODEL = 'moonshotai/kimi-k3'
-# `nvidia/nemotron-3.5-lightning-30b-a3b` is a reasoning model: the hidden
-# reasoning trace counts against max_tokens, so a small budget (the previous
-# 4096) can be consumed before any visible answer is emitted, yielding HTTP 200
-# with content=null and finish_reason="length". The model accepts 1..32768
-# (default 16384), so the budget starts at the model default and may be
-# escalated towards the cap when a length-truncated reply comes back empty.
-REQUEST_TIMEOUT_SECONDS = 60
-MAX_OUTPUT_TOKENS = 16384
-MAX_OUTPUT_TOKENS_CAP = 32768
+# `nvidia/nemotron-3.5-lightning-30b-a3b` is a reasoning model: its hidden
+# reasoning trace counts against ``max_tokens``. A single accessibility issue
+# only needs a short five-section brief, so the visible budget is kept small
+# (~2048 tokens) and the reasoning trace is capped below it via
+# ``reasoning_budget``. A large budget lets the model spend most of its time
+# thinking and overruns the request timeout — the production "Request timed
+# out" errors appeared when the budget was 16384 with a 60s timeout.
+REQUEST_TIMEOUT_SECONDS = 25
+MAX_OUTPUT_TOKENS = 2048
+MAX_OUTPUT_TOKENS_CAP = 4096
+REASONING_BUDGET_TOKENS = 1024
 
 # Rate limits, capacity spikes and read timeouts are transient and were
 # observed on roughly half of live calls, so they are retried before the
-# developer is shown an error for a condition that clears on its own.
+# developer is shown an error for a condition that clears on its own. Attempts
+# are deliberately few so a persistently slow provider cannot hold a request
+# for minutes: worst case is two 25s attempts plus one 2s backoff (~52s).
 RETRYABLE_CODES = frozenset({429, 500, 502, 503, 504})
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 2
 
 GENERIC_ERROR = 'AI analysis is temporarily unavailable. Please try again.'
@@ -165,6 +169,7 @@ class AIService:
                     temperature=0.2,
                     max_tokens=budget,
                     response_format={'type': 'json_object'},
+                    **self._extra_request_params(),
                 )
             except AIServiceError:
                 # Raised by the `client` property when the key is missing or
@@ -179,7 +184,8 @@ class AIService:
             except openai.APITimeoutError as exc:
                 if last:
                     raise AIServiceError(f'NVIDIA NIM request timed out: {exc}') from exc
-                logger.warning('NVIDIA NIM attempt %s/%s timed out; retrying', attempt, MAX_ATTEMPTS)
+                logger.warning('NVIDIA NIM attempt %s/%s timed out for model %r; retrying',
+                               attempt, MAX_ATTEMPTS, self.model)
             except openai.OpenAIError as exc:
                 # Other client-side failures, including connection errors.
                 timed_out = ('timeout' in type(exc).__name__.lower()
@@ -187,8 +193,8 @@ class AIService:
                 if last or not timed_out:
                     raise AIServiceError(
                         f'NVIDIA NIM request failed: {type(exc).__name__}: {exc}') from exc
-                logger.warning('NVIDIA NIM attempt %s/%s timed out (%s); retrying',
-                               attempt, MAX_ATTEMPTS, type(exc).__name__)
+                logger.warning('NVIDIA NIM attempt %s/%s timed out for model %r (%s); retrying',
+                               attempt, MAX_ATTEMPTS, self.model, type(exc).__name__)
             else:
                 text = self._reply_text(response)
                 if text:
@@ -217,6 +223,19 @@ class AIService:
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
         raise AIServiceError('NVIDIA NIM request failed after retries')  # pragma: no cover
+
+    @staticmethod
+    def _extra_request_params():
+        """Provider-specific request options, kept out of the call site.
+
+        ``reasoning_budget`` caps how many tokens a reasoning model may spend
+        thinking, keeping the visible answer inside ``max_tokens`` and the
+        request inside its timeout. It is only sent when configured, so a
+        deployment pointed at a non-reasoning model is unaffected.
+        """
+        if not REASONING_BUDGET_TOKENS:
+            return {}
+        return {'extra_body': {'reasoning_budget': REASONING_BUDGET_TOKENS}}
 
     @staticmethod
     def _reply_text(response):

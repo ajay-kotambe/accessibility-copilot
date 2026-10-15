@@ -8,6 +8,7 @@ never with the API key, and never with an invented brief.
 """
 
 import json
+import openai
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -24,6 +25,8 @@ from .services import (
     MAX_ATTEMPTS,
     MAX_OUTPUT_TOKENS,
     MAX_OUTPUT_TOKENS_CAP,
+    REASONING_BUDGET_TOKENS,
+    REQUEST_TIMEOUT_SECONDS,
     RETRY_BACKOFF_SECONDS,
 )
 
@@ -167,7 +170,7 @@ class AIEmptyResponseTests(AIBaseTestCase):
         self.assertEqual(client.chat.completions.create.call_count, MAX_ATTEMPTS)
         self.assertEqual(mock_sleep.call_count, MAX_ATTEMPTS - 1)
         mock_sleep.assert_has_calls(
-            [call(RETRY_BACKOFF_SECONDS * 1), call(RETRY_BACKOFF_SECONDS * 2)]
+            [call(RETRY_BACKOFF_SECONDS * n) for n in range(1, MAX_ATTEMPTS)]
         )
 
         reason = ctx.exception.reason
@@ -227,8 +230,8 @@ class AIEmptyResponseTests(AIBaseTestCase):
             c.kwargs['max_tokens'] for c in client.chat.completions.create.call_args_list
         ]
         self.assertEqual(budgets[0], MAX_OUTPUT_TOKENS)
-        self.assertEqual(budgets[1], MAX_OUTPUT_TOKENS_CAP)
-        self.assertEqual(budgets[2], MAX_OUTPUT_TOKENS_CAP)
+        self.assertEqual(budgets[-1], MAX_OUTPUT_TOKENS_CAP)
+        self.assertTrue(all(b <= MAX_OUTPUT_TOKENS_CAP for b in budgets))
 
         reason = ctx.exception.reason
         self.assertIn('empty response body', reason)
@@ -272,6 +275,107 @@ class AIEmptyResponseTests(AIBaseTestCase):
             resp2 = api.post(f'/api/issues/{other.id}/analyze/', format='json')
         self.assertEqual(resp2.status_code, 200)
         self.assertTrue(AIAnalysis.objects.filter(issue=other).exists())
+
+
+class AITimeoutTests(AIBaseTestCase):
+    """Production symptom: ``NVIDIA NIM request timed out`` on every attempt.
+
+    A slow provider must be retried a bounded number of times, then fail only
+    the one issue request with a generic message — never the scan, never with
+    the API key, and never blocking other issues.
+    """
+
+    @staticmethod
+    def _timeout():
+        return openai.APITimeoutError(request=MagicMock())
+
+    @patch('ai.services.time.sleep')
+    def test_timeout_is_retried_then_succeeds(self, mock_sleep):
+        service, client = make_service(self._timeout(), completion(VALID_BRIEF))
+
+        with self.assertLogs('ai.services', level='WARNING') as logs:
+            result = service.analyze_issue(self.issue)
+
+        self.assertEqual(result['explanation'], 'The image has no alt text.')
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        mock_sleep.assert_called_once_with(RETRY_BACKOFF_SECONDS * 1)
+        output = '\n'.join(logs.output)
+        self.assertIn('timed out', output)
+        self.assertIn('test/model', output)
+        self.assertNotIn('unit-test-key', output)
+
+    @patch('ai.services.time.sleep')
+    def test_persistent_timeout_stops_after_max_attempts(self, mock_sleep):
+        service, client = make_service(
+            self._timeout(), self._timeout(), self._timeout()
+        )
+
+        with self.assertRaises(AIServiceError) as ctx:
+            service.analyze_issue(self.issue)
+
+        self.assertEqual(client.chat.completions.create.call_count, MAX_ATTEMPTS)
+        self.assertEqual(mock_sleep.call_count, MAX_ATTEMPTS - 1)
+        self.assertIn('timed out', ctx.exception.reason)
+        self.assertEqual(ctx.exception.user_message, GENERIC_ERROR)
+
+    @patch('ai.services.time.sleep')
+    def test_endpoint_timeout_is_graceful_and_keeps_scan_and_other_issues(self, mock_sleep):
+        service, _ = make_service(self._timeout(), self._timeout(), self._timeout())
+        api = APIClient()
+
+        with patch('ai.views.AIService', return_value=service):
+            with self.assertLogs('ai.views', level='WARNING') as logs:
+                resp = api.post(f'/api/issues/{self.issue.id}/analyze/', format='json')
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.data['detail'], GENERIC_ERROR)
+        self.assertNotIn('timed out', str(resp.data))
+        self.assertIn('timed out', '\n'.join(logs.output))
+
+        # A timeout must not invalidate the deterministic scan result or
+        # invent a half-empty AI brief.
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Scan.COMPLETED)
+        self.assertEqual(self.scan.score, 87)
+        self.assertFalse(AIAnalysis.objects.filter(issue=self.issue).exists())
+
+        # The timeout on one issue must not prevent another issue from working.
+        other = Issue.objects.create(
+            scan=self.scan, rule_id='button-name', severity=Issue.SERIOUS,
+            category='Forms', description='Buttons must have discernible text',
+        )
+        good, _ = make_service(completion(VALID_BRIEF))
+        with patch('ai.views.AIService', return_value=good):
+            resp2 = api.post(f'/api/issues/{other.id}/analyze/', format='json')
+        self.assertEqual(resp2.status_code, 200)
+        self.assertTrue(AIAnalysis.objects.filter(issue=other).exists())
+
+
+class AIRequestConfigurationTests(TestCase):
+    def test_total_worst_case_wait_is_bounded(self):
+        # Repeated provider waits must never hold a request for around a
+        # minute or more: attempts and timeout together are the ceiling.
+        worst_case = (
+            REQUEST_TIMEOUT_SECONDS * MAX_ATTEMPTS
+            + RETRY_BACKOFF_SECONDS * (MAX_ATTEMPTS - 1)
+        )
+        self.assertLessEqual(worst_case, 60)
+
+    def test_output_budget_is_sized_for_a_single_issue(self):
+        self.assertLessEqual(MAX_OUTPUT_TOKENS, 4096)
+        self.assertLessEqual(MAX_OUTPUT_TOKENS_CAP, 4096)
+
+    def test_reasoning_trace_is_capped_below_the_output_budget(self):
+        # The visible answer must keep room inside max_tokens; otherwise the
+        # thinking trace consumes the whole allowance and the reply is empty.
+        self.assertGreater(REASONING_BUDGET_TOKENS, 0)
+        self.assertLess(REASONING_BUDGET_TOKENS, MAX_OUTPUT_TOKENS)
+
+    def test_reasoning_budget_is_sent_as_extra_body(self):
+        self.assertEqual(
+            AIService._extra_request_params(),
+            {'extra_body': {'reasoning_budget': REASONING_BUDGET_TOKENS}},
+        )
 
 
 class AIModelConfigurationTests(TestCase):
