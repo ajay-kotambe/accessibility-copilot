@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import patch
 
 from django.db import OperationalError
@@ -182,4 +183,49 @@ class ScanMissingChromiumTests(TestCase):
         self.assertIsNotNone(scan.completed_at)
         self.assertNotIn('ms-playwright', scan.error_message)
         self.assertEqual(user_message_for(ctx.exception), MESSAGE_GENERIC)
+
+
+class DeploymentConfigTests(TestCase):
+    """Regression: Railpack only copies whitelisted paths (/app/.venv, /app)
+    from a build step into the deploy image, so browsers downloaded by a
+    custom buildCommand to /root/.cache/ms-playwright never reached the
+    runtime container ("Executable doesn't exist at
+    /root/.cache/ms-playwright/..."). The backend image must therefore be
+    built from the Dockerfile, which installs Chromium into the stable
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright inside the same single image
+    that serves Django, while Railway's gunicorn start command and the
+    migrate pre-deploy command stay unchanged.
+    """
+
+    BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+    def test_dockerfile_installs_chromium_at_stable_browsers_path(self):
+        dockerfile = (self.BACKEND_DIR / 'Dockerfile').read_text()
+        self.assertIn('ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright', dockerfile)
+        self.assertIn('python -m playwright install --with-deps chromium', dockerfile)
+        # The install must run in the same stage as the app, after the pinned
+        # requirements, so the browser revision always matches the runtime
+        # playwright package.
+        self.assertIn('pip install --no-cache-dir -r requirements.txt', dockerfile)
+        self.assertIn('FROM python:3.13-slim', dockerfile)
+        self.assertIn('CMD gunicorn config.wsgi:application', dockerfile)
+        self.assertIn('--bind 0.0.0.0:$PORT', dockerfile)
+
+    def test_railway_config_keeps_gunicorn_and_migrations(self):
+        import json
+
+        config = json.loads((self.BACKEND_DIR / 'railway.json').read_text())
+        deploy = config['deploy']
+        self.assertEqual(
+            deploy['startCommand'],
+            'gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300',
+        )
+        self.assertEqual(deploy['preDeployCommand'], 'python manage.py migrate --noinput')
+        # A buildCommand here would be ignored with a Dockerfile present and
+        # previously caused the browsers to be dropped from the image.
+        self.assertNotIn('build', config)
+
+    def test_requirements_pin_playwright_for_revision_match(self):
+        requirements = (self.BACKEND_DIR / 'requirements.txt').read_text()
+        self.assertIn('playwright==', requirements)
 

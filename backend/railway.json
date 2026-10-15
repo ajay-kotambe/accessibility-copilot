@@ -1,8 +1,5 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
-  "build": {
-    "buildCommand": "python -m playwright install --with-deps chromium"
-  },
   "deploy": {
     "startCommand": "gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300",
     "preDeployCommand": "python manage.py migrate --noinput",
