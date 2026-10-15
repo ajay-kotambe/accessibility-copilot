@@ -22,19 +22,31 @@ from .services import (
     AIServiceError,
     GENERIC_ERROR,
     MAX_ATTEMPTS,
+    MAX_OUTPUT_TOKENS,
+    MAX_OUTPUT_TOKENS_CAP,
     RETRY_BACKOFF_SECONDS,
 )
 
 
-def completion(content, finish_reason='stop'):
-    """A minimal OpenAI-compatible chat completion object."""
+def completion(content, finish_reason='stop', reasoning=None, reasoning_tokens=None):
+    """A minimal OpenAI-compatible chat completion object.
+
+    ``reasoning``/``reasoning_tokens`` model a reasoning model that spent part
+    of its ``max_tokens`` allowance on a hidden trace before emitting content.
+    """
+    message = SimpleNamespace(content=content)
+    if reasoning is not None:
+        message.reasoning = reasoning
+    usage = None
+    if reasoning_tokens is not None:
+        usage = SimpleNamespace(
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens)
+        )
     return SimpleNamespace(
         choices=[
-            SimpleNamespace(
-                finish_reason=finish_reason,
-                message=SimpleNamespace(content=content),
-            )
-        ]
+            SimpleNamespace(finish_reason=finish_reason, message=message)
+        ],
+        usage=usage,
     )
 
 
@@ -85,6 +97,10 @@ class AISuccessTests(AIBaseTestCase):
         for field in ('explanation', 'why_it_matters', 'suggested_fix', 'corrected_code'):
             self.assertTrue(result[field])
         self.assertEqual(client.chat.completions.create.call_count, 1)
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs['max_tokens'],
+            MAX_OUTPUT_TOKENS,
+        )
         mock_sleep.assert_not_called()
 
     @patch('ai.services.time.sleep')
@@ -163,6 +179,62 @@ class AIEmptyResponseTests(AIBaseTestCase):
         logged = '\n'.join(logs.output)
         self.assertNotIn('unit-test-key', logged)
         self.assertNotIn('VALID_BRIEF', logged)
+
+    @patch('ai.services.time.sleep')
+    def test_length_truncated_empty_reply_escalates_token_budget(self, mock_sleep):
+        # Production symptom: a reasoning model spends the whole 16384-token
+        # allowance on its hidden trace, so the reply is content=null with
+        # finish_reason=length. The next attempt must request more room within
+        # the model's documented cap instead of repeating the same budget.
+        truncated = completion(
+            None, finish_reason='length',
+            reasoning='x' * 120, reasoning_tokens=MAX_OUTPUT_TOKENS,
+        )
+        service, client = make_service(truncated, completion(VALID_BRIEF))
+
+        with self.assertLogs('ai.services', level='WARNING') as logs:
+            result = service.analyze_issue(self.issue)
+
+        self.assertEqual(result['explanation'], 'The image has no alt text.')
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        budgets = [
+            c.kwargs['max_tokens'] for c in client.chat.completions.create.call_args_list
+        ]
+        self.assertEqual(budgets[0], MAX_OUTPUT_TOKENS)
+        self.assertEqual(budgets[1], min(MAX_OUTPUT_TOKENS * 2, MAX_OUTPUT_TOKENS_CAP))
+        self.assertGreater(budgets[1], budgets[0])
+
+        output = '\n'.join(logs.output)
+        self.assertIn('finish_reason=length', output)
+        self.assertIn('reasoning_length=120', output)
+        self.assertIn(f'reasoning_tokens={MAX_OUTPUT_TOKENS}', output)
+        self.assertIn(f'max_tokens={budgets[1]}', output)
+        self.assertNotIn('unit-test-key', output)
+
+    @patch('ai.services.time.sleep')
+    def test_persistent_length_truncation_fails_with_token_budget_diagnostic(self, mock_sleep):
+        truncated = completion(
+            None, finish_reason='length',
+            reasoning='x' * 40, reasoning_tokens=MAX_OUTPUT_TOKENS,
+        )
+        service, client = make_service(truncated, truncated, truncated)
+
+        with self.assertRaises(AIServiceError) as ctx:
+            service.analyze_issue(self.issue)
+
+        self.assertEqual(client.chat.completions.create.call_count, MAX_ATTEMPTS)
+        budgets = [
+            c.kwargs['max_tokens'] for c in client.chat.completions.create.call_args_list
+        ]
+        self.assertEqual(budgets[0], MAX_OUTPUT_TOKENS)
+        self.assertEqual(budgets[1], MAX_OUTPUT_TOKENS_CAP)
+        self.assertEqual(budgets[2], MAX_OUTPUT_TOKENS_CAP)
+
+        reason = ctx.exception.reason
+        self.assertIn('empty response body', reason)
+        self.assertIn('finish_reason=length', reason)
+        self.assertIn('reasoning_length=40', reason)
+        self.assertEqual(ctx.exception.user_message, GENERIC_ERROR)
 
     @patch('ai.services.time.sleep')
     def test_endpoint_fails_one_issue_gracefully_and_keeps_scan_results(self, mock_sleep):

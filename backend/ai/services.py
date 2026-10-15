@@ -29,8 +29,15 @@ logger = logging.getLogger(__name__)
 # OpenAI v1.x client; the key stays server-side and is never sent to browsers.
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
 DEFAULT_MODEL = 'moonshotai/kimi-k3'
+# `nvidia/nemotron-3.5-lightning-30b-a3b` is a reasoning model: the hidden
+# reasoning trace counts against max_tokens, so a small budget (the previous
+# 4096) can be consumed before any visible answer is emitted, yielding HTTP 200
+# with content=null and finish_reason="length". The model accepts 1..32768
+# (default 16384), so the budget starts at the model default and may be
+# escalated towards the cap when a length-truncated reply comes back empty.
 REQUEST_TIMEOUT_SECONDS = 60
-MAX_OUTPUT_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 16384
+MAX_OUTPUT_TOKENS_CAP = 32768
 
 # Rate limits, capacity spikes and read timeouts are transient and were
 # observed on roughly half of live calls, so they are retried before the
@@ -143,6 +150,12 @@ class AIService:
             {'role': 'user', 'content': prompt},
         ]
 
+        # The output budget grows only when a reply is truncated by
+        # ``finish_reason="length"`` and comes back empty (the reasoning trace
+        # ate the whole allowance before any visible answer). It never exceeds
+        # the model's documented maximum, so retries stay bounded.
+        budget = MAX_OUTPUT_TOKENS
+
         for attempt in range(1, MAX_ATTEMPTS + 1):
             last = attempt == MAX_ATTEMPTS
             try:
@@ -150,7 +163,7 @@ class AIService:
                     model=self.model,
                     messages=messages,
                     temperature=0.2,
-                    max_tokens=MAX_OUTPUT_TOKENS,
+                    max_tokens=budget,
                     response_format={'type': 'json_object'},
                 )
             except AIServiceError:
@@ -187,11 +200,18 @@ class AIService:
                 if last:
                     raise AIServiceError(
                         f'NVIDIA NIM returned an empty response body after '
-                        f'{MAX_ATTEMPTS} attempts for model {self.model!r} ({detail})'
+                        f'{MAX_ATTEMPTS} attempts for model {self.model!r} '
+                        f'(max_tokens={budget}, {detail})'
                     )
+                # A length-truncated empty reply means the reasoning budget, not
+                # the provider, consumed the allowance; give the answer more room
+                # on the next attempt rather than repeating the same request.
+                if self._finish_reason(response) == 'length' and budget < MAX_OUTPUT_TOKENS_CAP:
+                    budget = min(budget * 2, MAX_OUTPUT_TOKENS_CAP)
                 logger.warning(
-                    'NVIDIA NIM attempt %s/%s returned an empty reply for model %r (%s); retrying',
-                    attempt, MAX_ATTEMPTS, self.model, detail,
+                    'NVIDIA NIM attempt %s/%s returned an empty reply for model %r '
+                    '(%s); retrying with max_tokens=%s',
+                    attempt, MAX_ATTEMPTS, self.model, detail, budget,
                 )
 
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
@@ -215,12 +235,22 @@ class AIService:
         return content
 
     @staticmethod
-    def _empty_reply_detail(response):
+    def _finish_reason(response):
+        """The first choice's finish reason, or None when unavailable."""
+        choices = getattr(response, 'choices', None) or []
+        if not choices:
+            return None
+        return getattr(choices[0], 'finish_reason', None)
+
+    @classmethod
+    def _empty_reply_detail(cls, response):
         """Key-free diagnostics for an empty completion, for server logs only.
 
-        Reports choice count, finish reason and content length so the reason
-        an empty body arrived (e.g. ``finish_reason=length`` or ``content_filter``)
-        is visible in Railway without exposing the API key or the reply itself.
+        Reports the finish reason, the visible content length and the size of
+        the reasoning trace (vLLM names it ``reasoning``; older builds used
+        ``reasoning_content``) so a reasoning model that spent its whole
+        ``max_tokens`` allowance before emitting an answer is diagnosable in
+        Railway without exposing the API key or the reply itself.
         """
         choices = getattr(response, 'choices', None) or []
         if not choices:
@@ -230,7 +260,24 @@ class AIService:
         message = getattr(choice, 'message', None)
         content = getattr(message, 'content', None)
         content_length = len(content) if isinstance(content, str) else -1
-        return f'finish_reason={finish_reason} content_length={content_length}'
+
+        reasoning = getattr(message, 'reasoning', None)
+        if not isinstance(reasoning, str):
+            reasoning = getattr(message, 'reasoning_content', None)
+        reasoning_length = len(reasoning) if isinstance(reasoning, str) else 0
+
+        usage = getattr(response, 'usage', None)
+        details = getattr(usage, 'completion_tokens_details', None)
+        reasoning_tokens = getattr(details, 'reasoning_tokens', None)
+
+        parts = [
+            f'finish_reason={finish_reason}',
+            f'content_length={content_length}',
+            f'reasoning_length={reasoning_length}',
+        ]
+        if reasoning_tokens is not None:
+            parts.append(f'reasoning_tokens={reasoning_tokens}')
+        return ' '.join(parts)
 
     @staticmethod
     def _status_code(exc):
