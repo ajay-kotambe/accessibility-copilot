@@ -14,6 +14,7 @@ from scanner.services.navigation_errors import (
     friendly_navigation_error,
     user_message_for,
 )
+from scanner.services.playwright_scanner import run_scan
 
 
 class FriendlyNavigationErrorTests(TestCase):
@@ -136,4 +137,49 @@ class ScanCreateDatabaseFailureTests(TestCase):
         self.assertNotIn('scanner_scan', body)
         self.assertNotIn('relation', body.lower())
         self.assertIn('scanner_scan', '\n'.join(captured.output))
+
+
+class ScanMissingChromiumTests(TestCase):
+    """Regression: production containers only pip-install the Playwright
+    package; unless the build runs `playwright install chromium`,
+    p.chromium.launch() raises "Executable doesn't exist ... playwright
+    install" within a few hundred ms of Scan.objects.create(). The pipeline
+    must log that traceback server-side, mark the scan FAILED with a score
+    of None, and keep the raw Playwright text out of the record and API.
+    """
+
+    LAUNCH_ERROR = (
+        'BrowserType.launch: Executable doesn\'t exist at '
+        '/root/.cache/ms-playwright/chromium_headless_shell-1243/'
+        'chrome-headless-shell-linux64/chrome-headless-shell\n'
+        'Please run the following command to download new browsers:\n'
+        '    playwright install'
+    )
+
+    @patch('scanner.services.playwright_scanner.sync_playwright')
+    def test_missing_browser_binary_fails_scan_safely(self, mock_sync_playwright):
+        class FailingBrowserType:
+            def launch(self, **kwargs):
+                raise Exception(ScanMissingChromiumTests.LAUNCH_ERROR)
+
+        class FakePlaywright:
+            chromium = FailingBrowserType()
+
+        mock_sync_playwright.return_value.__enter__.return_value = FakePlaywright()
+
+        scan = Scan.objects.create(url='https://example.com', status=Scan.QUEUED)
+        with self.assertLogs('scanner.services.playwright_scanner', level='ERROR') as logs:
+            with self.assertRaises(Exception) as ctx:
+                run_scan(scan.id)
+
+        self.assertIn('Executable doesn\'t exist', '\n'.join(logs.output))
+        self.assertIn('playwright install', '\n'.join(logs.output))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Scan.FAILED)
+        self.assertEqual(scan.error_message, MESSAGE_GENERIC)
+        self.assertIsNone(scan.score)
+        self.assertIsNotNone(scan.completed_at)
+        self.assertNotIn('ms-playwright', scan.error_message)
+        self.assertEqual(user_message_for(ctx.exception), MESSAGE_GENERIC)
 
