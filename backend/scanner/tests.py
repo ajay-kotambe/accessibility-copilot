@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+from django.db import OperationalError
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -108,3 +109,31 @@ class ScanFailureApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 500)
         self.assertEqual(resp.data['error'], message)
+
+
+class ScanCreateDatabaseFailureTests(TestCase):
+    """Regression: the queue write runs before Playwright, so a database
+    failure there raised out of the view as an opaque Django 500 with no
+    server-side traceback. The view must log the full exception and answer
+    with a generic message that does not leak the database error.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+
+    @patch('scanner.views.Scan.objects.create')
+    def test_database_error_on_create_is_logged_without_leaking(self, mock_create):
+        mock_create.side_effect = OperationalError(
+            'relation "scanner_scan" does not exist'
+        )
+        with self.assertLogs('scanner.views', level='ERROR') as captured:
+            resp = self.client.post(
+                '/api/scans/', {'url': 'https://example.com'}, format='json'
+            )
+
+        self.assertEqual(resp.status_code, 500)
+        body = str(resp.data)
+        self.assertNotIn('scanner_scan', body)
+        self.assertNotIn('relation', body.lower())
+        self.assertIn('scanner_scan', '\n'.join(captured.output))
+

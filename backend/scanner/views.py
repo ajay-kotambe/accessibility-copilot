@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -8,6 +10,8 @@ from .models import Scan, Page, Issue
 from .serializers import ScanSerializer, IssueSerializer
 from .services.navigation_errors import user_message_for
 from .services.playwright_scanner import run_scan
+
+logger = logging.getLogger(__name__)
 
 
 class ScanListCreateView(APIView):
@@ -20,7 +24,18 @@ class ScanListCreateView(APIView):
         url = request.data.get('url')
         if not url:
             return Response({'error': 'URL is required'}, status=status.HTTP_400_BAD_REQUEST)
-        scan = Scan.objects.create(url=url, status=Scan.QUEUED)
+        try:
+            scan = Scan.objects.create(url=url, status=Scan.QUEUED)
+        except Exception:
+            # The queue write happens before Playwright is ever started, so a
+            # database failure here (unapplied migrations, unreachable database)
+            # would otherwise surface only as an opaque Django 500. Log the full
+            # traceback server-side; the client gets a generic sentence.
+            logger.exception('Failed to create scan record for url=%r', url)
+            return Response(
+                {'error': 'The scan could not be started. Please try again later.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
         try:
             run_scan(scan.id)
         except Exception as e:
