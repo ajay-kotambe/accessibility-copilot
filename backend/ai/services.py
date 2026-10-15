@@ -178,9 +178,21 @@ class AIService:
                                attempt, MAX_ATTEMPTS, type(exc).__name__)
             else:
                 text = self._reply_text(response)
-                if not text:
-                    raise AIServiceError('NVIDIA NIM returned an empty response body')
-                return text
+                if text:
+                    return text
+                # An empty choices/content body has been observed on NIM under
+                # load even when HTTP 200 came back, so it is treated like any
+                # other transient condition: bounded retries with backoff.
+                detail = self._empty_reply_detail(response)
+                if last:
+                    raise AIServiceError(
+                        f'NVIDIA NIM returned an empty response body after '
+                        f'{MAX_ATTEMPTS} attempts for model {self.model!r} ({detail})'
+                    )
+                logger.warning(
+                    'NVIDIA NIM attempt %s/%s returned an empty reply for model %r (%s); retrying',
+                    attempt, MAX_ATTEMPTS, self.model, detail,
+                )
 
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
@@ -188,12 +200,37 @@ class AIService:
 
     @staticmethod
     def _reply_text(response):
-        """Extract the assistant message text from a chat completion."""
+        """Extract the assistant message text from a chat completion.
+
+        Returns None when choices are missing, content is absent, or content
+        is blank/whitespace-only — all of which count as an empty reply.
+        """
         choices = getattr(response, 'choices', None) or []
         if not choices:
             return None
         message = getattr(choices[0], 'message', None)
-        return getattr(message, 'content', None)
+        content = getattr(message, 'content', None)
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return content
+
+    @staticmethod
+    def _empty_reply_detail(response):
+        """Key-free diagnostics for an empty completion, for server logs only.
+
+        Reports choice count, finish reason and content length so the reason
+        an empty body arrived (e.g. ``finish_reason=length`` or ``content_filter``)
+        is visible in Railway without exposing the API key or the reply itself.
+        """
+        choices = getattr(response, 'choices', None) or []
+        if not choices:
+            return 'choices=[]'
+        choice = choices[0]
+        finish_reason = getattr(choice, 'finish_reason', None) or 'unknown'
+        message = getattr(choice, 'message', None)
+        content = getattr(message, 'content', None)
+        content_length = len(content) if isinstance(content, str) else -1
+        return f'finish_reason={finish_reason} content_length={content_length}'
 
     @staticmethod
     def _status_code(exc):
