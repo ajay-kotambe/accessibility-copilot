@@ -113,4 +113,4 @@ CORS_ALLOWED_ORIGINS = [FRONTEND_URL]
 
 # AI Copilot provider. Backend-only: these are never exposed to the frontend.
 NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', '')
-NVIDIA_MODEL = os.getenv('NVIDIA_MODEL') or 'moonshotai/kimi-k3'
+NVIDIA_MODEL = os.getenv('NVIDIA_MODEL') or 'nvidia/nemotron-3.5-lightning-30b-a3b'

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # OpenAI-compatible endpoint for NVIDIA NIM. The backend reaches it through the
 # OpenAI v1.x client; the key stays server-side and is never sent to browsers.
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
-DEFAULT_MODEL = 'moonshotai/kimi-k3'
+DEFAULT_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b'
 # `nvidia/nemotron-3.5-lightning-30b-a3b` is a reasoning model: its hidden
 # reasoning trace and the visible answer share one ``max_tokens`` budget. A
 # single accessibility issue only needs a short five-section brief, so the
