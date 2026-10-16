@@ -25,6 +25,7 @@ from .services import (
     MAX_ATTEMPTS,
     MAX_OUTPUT_TOKENS,
     MAX_OUTPUT_TOKENS_CAP,
+    NVIDIA_BASE_URL,
     REASONING_BUDGET_TOKENS,
     REQUEST_TIMEOUT_SECONDS,
     RETRY_BACKOFF_SECONDS,
@@ -353,29 +354,74 @@ class AITimeoutTests(AIBaseTestCase):
 
 class AIRequestConfigurationTests(TestCase):
     def test_total_worst_case_wait_is_bounded(self):
-        # Repeated provider waits must never hold a request for around a
-        # minute or more: attempts and timeout together are the ceiling.
+        # Attempts and timeout together are the ceiling. MAX_ATTEMPTS stays at
+        # 2 and the backoff stays short so a persistently slow provider cannot
+        # hold a request for minutes.
         worst_case = (
             REQUEST_TIMEOUT_SECONDS * MAX_ATTEMPTS
             + RETRY_BACKOFF_SECONDS * (MAX_ATTEMPTS - 1)
         )
-        self.assertLessEqual(worst_case, 60)
+        self.assertEqual(MAX_ATTEMPTS, 2)
+        self.assertLessEqual(RETRY_BACKOFF_SECONDS, 2)
+        self.assertLessEqual(REQUEST_TIMEOUT_SECONDS, 45)
+        self.assertLessEqual(worst_case, REQUEST_TIMEOUT_SECONDS * MAX_ATTEMPTS + 2)
 
     def test_output_budget_is_sized_for_a_single_issue(self):
-        self.assertLessEqual(MAX_OUTPUT_TOKENS, 4096)
-        self.assertLessEqual(MAX_OUTPUT_TOKENS_CAP, 4096)
+        self.assertEqual(MAX_OUTPUT_TOKENS, 1024)
+        self.assertEqual(MAX_OUTPUT_TOKENS_CAP, 2048)
 
     def test_reasoning_trace_is_capped_below_the_output_budget(self):
         # The visible answer must keep room inside max_tokens; otherwise the
         # thinking trace consumes the whole allowance and the reply is empty.
+        self.assertEqual(REASONING_BUDGET_TOKENS, 256)
         self.assertGreater(REASONING_BUDGET_TOKENS, 0)
         self.assertLess(REASONING_BUDGET_TOKENS, MAX_OUTPUT_TOKENS)
 
     def test_reasoning_budget_is_sent_as_extra_body(self):
+        # `reasoning_budget` is the field the hosted integrate.api.nvidia.com
+        # endpoint accepts and honours for `nvidia/nemotron-3.5-lightning`.
+        params = AIService._extra_request_params()
         self.assertEqual(
-            AIService._extra_request_params(),
+            params,
             {'extra_body': {'reasoning_budget': REASONING_BUDGET_TOKENS}},
         )
+        self.assertNotIn('thinking_token_budget', params['extra_body'])
+
+    def test_reasoning_control_is_optional(self):
+        with patch('ai.services.REASONING_BUDGET_TOKENS', 0):
+            self.assertEqual(AIService._extra_request_params(), {})
+
+
+class AIRequestVerificationTests(AIBaseTestCase):
+    """The request actually sent must carry the configured budget and timeout.
+
+    A smaller ``max_tokens`` only bounds the visible answer. Unless the hidden
+    reasoning trace is capped with the model-supported field, reducing
+    ``max_tokens`` does not reduce reasoning.
+    """
+
+    @patch('ai.services.time.sleep')
+    def test_request_sends_configured_tokens_and_reasoning_budget(self, mock_sleep):
+        service, client = make_service(completion(VALID_BRIEF))
+
+        service.analyze_issue(self.issue)
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(kwargs['max_tokens'], MAX_OUTPUT_TOKENS)
+        self.assertEqual(kwargs['extra_body']['reasoning_budget'],
+                         REASONING_BUDGET_TOKENS)
+        self.assertNotIn('thinking_token_budget', kwargs['extra_body'])
+        self.assertEqual(kwargs['response_format'], {'type': 'json_object'})
+
+    @patch('ai.services.OpenAI')
+    def test_client_is_built_with_the_configured_timeout(self, mock_openai):
+        AIService(api_key='unit-test-key').client
+
+        kwargs = mock_openai.call_args.kwargs
+        self.assertEqual(kwargs['timeout'], REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs['base_url'], NVIDIA_BASE_URL)
+        self.assertEqual(kwargs['max_retries'], 0)
+        self.assertNotIn('unit-test-key', str(kwargs.get('base_url', '')))
 
 
 class AIModelConfigurationTests(TestCase):

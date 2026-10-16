@@ -30,22 +30,24 @@ logger = logging.getLogger(__name__)
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
 DEFAULT_MODEL = 'moonshotai/kimi-k3'
 # `nvidia/nemotron-3.5-lightning-30b-a3b` is a reasoning model: its hidden
-# reasoning trace counts against ``max_tokens``. A single accessibility issue
-# only needs a short five-section brief, so the visible budget is kept small
-# (~2048 tokens) and the reasoning trace is capped below it via
-# ``reasoning_budget``. A large budget lets the model spend most of its time
-# thinking and overruns the request timeout — the production "Request timed
-# out" errors appeared when the budget was 16384 with a 60s timeout.
-REQUEST_TIMEOUT_SECONDS = 25
-MAX_OUTPUT_TOKENS = 2048
-MAX_OUTPUT_TOKENS_CAP = 4096
-REASONING_BUDGET_TOKENS = 1024
+# reasoning trace and the visible answer share one ``max_tokens`` budget. A
+# single accessibility issue only needs a short five-section brief, so the
+# visible budget is kept small (1024, capped at 2048) and the reasoning trace is
+# capped below it via the top-level ``reasoning_budget`` request field (256).
+# Reducing ``max_tokens`` alone does NOT reduce hidden reasoning: the hosted
+# ``integrate.api.nvidia.com`` endpoint honors ``reasoning_budget`` (verified —
+# reasoning tokens stop at the budget), and without it the trace can consume the
+# whole allowance and return an empty body with ``finish_reason="length"``.
+REQUEST_TIMEOUT_SECONDS = 45
+MAX_OUTPUT_TOKENS = 1024
+MAX_OUTPUT_TOKENS_CAP = 2048
+REASONING_BUDGET_TOKENS = 256
 
 # Rate limits, capacity spikes and read timeouts are transient and were
 # observed on roughly half of live calls, so they are retried before the
 # developer is shown an error for a condition that clears on its own. Attempts
 # are deliberately few so a persistently slow provider cannot hold a request
-# for minutes: worst case is two 25s attempts plus one 2s backoff (~52s).
+# for minutes: worst case is two 45s attempts plus one 2s backoff (~92s).
 RETRYABLE_CODES = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 2
@@ -228,10 +230,14 @@ class AIService:
     def _extra_request_params():
         """Provider-specific request options, kept out of the call site.
 
-        ``reasoning_budget`` caps how many tokens a reasoning model may spend
-        thinking, keeping the visible answer inside ``max_tokens`` and the
-        request inside its timeout. It is only sent when configured, so a
-        deployment pointed at a non-reasoning model is unaffected.
+        ``nvidia/nemotron-3.5-lightning-30b-a3b`` counts its hidden reasoning
+        trace against ``max_tokens``. The hosted ``integrate.api.nvidia.com``
+        endpoint caps that trace with the top-level ``reasoning_budget`` field
+        (verified: reasoning tokens stop at the budget). Without it, or with the
+        container-only ``thinking_token_budget`` key, the request is either left
+        unbounded or rejected with HTTP 400, so the visible answer can be
+        starved. The cap is only sent when configured, so a deployment pointed
+        at a non-reasoning model is unaffected.
         """
         if not REASONING_BUDGET_TOKENS:
             return {}

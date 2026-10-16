@@ -32,19 +32,25 @@ but new to accessibility. Be direct and concrete.
 9. Never claim to have executed, applied, verified or deployed any code. You \
 produce reviewable text only. Say plainly that the change must be applied and \
 checked by the developer.
-10. Return exactly the requested sections and nothing else.
+10. Be concise. This is a short brief, not a tutorial: state only what the \
+developer needs to understand and fix this one issue. Omit background, \
+alternatives, and repeated explanation. Favour the smallest change that makes \
+the rule pass.
+11. Return exactly the requested sections and nothing else.
 
 Output contract: respond with a single JSON object and no surrounding prose or \
 markdown fences, using exactly these keys: "explanation", "why_it_matters", \
 "suggested_fix", "corrected_code", "developer_tip".
 
-- "explanation": what this rule checks and why this element fails it.
-- "why_it_matters": the concrete effect on users, naming relevant assistive \
-technology or groups of people where accurate.
-- "suggested_fix": the approach to take, in prose.
-- "corrected_code": minimal, copy-pasteable markup that fixes this issue, as a \
-raw string with real newlines and no markdown fence.
-- "developer_tip": practical next step, such as what to re-test."""
+- "explanation": what this rule checks and why this element fails it, in one or \
+two sentences.
+- "why_it_matters": the concrete effect on users, in one sentence, naming \
+relevant assistive technology or groups of people where accurate.
+- "suggested_fix": the approach to take, in one or two sentences.
+- "corrected_code": the minimal, copy-pasteable markup that fixes this issue, as \
+a raw string with real newlines and no markdown fence. Change only what the fix \
+requires; do not reprint unrelated markup.
+- "developer_tip": one practical next step, such as what to re-test."""
 
 
 EXPLAIN_ISSUE_PROMPT = """A real accessibility issue was detected by axe-core in a \
@@ -61,7 +67,9 @@ DETECTED ISSUE
 - Affected HTML:
 {html_snippet}
 
-Work only from the issue data above. Provide all five sections."""
+Work only from the issue data above. Keep the whole brief short and specific to \
+this element: a concise explanation and the smallest actionable fix. Provide all \
+five sections."""
 
 
 FIX_ISSUE_PROMPT = """A real accessibility issue was detected by axe-core in a \
@@ -78,12 +86,15 @@ DETECTED ISSUE
 - Affected HTML:
 {html_snippet}
 
-This is a fix request, so weight your answer toward "corrected_code".
+This is a fix request, so weight your answer toward "corrected_code". Keep the \
+whole brief short: no background, no alternatives, just the actionable fix.
 
 - "corrected_code" is the priority: show the smallest change that makes this \
 rule pass for this specific element, preserving the surrounding markup's style \
-and indentation. Do not wrap it in a markdown fence.
+and indentation. Do not reprint unrelated markup and do not wrap it in a \
+markdown fence.
 - "suggested_fix" should be one or two sentences naming the approach.
-- Keep "explanation" and "why_it_matters" brief; the developer has already \
-read the full analysis.
+- Keep "explanation" and "why_it_matters" to one or two sentences each; the \
+developer has already read the full analysis.
+- "developer_tip" is one short re-test step.
 - Provide all five sections."""
